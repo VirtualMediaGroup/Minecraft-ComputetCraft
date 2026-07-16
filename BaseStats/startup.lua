@@ -13,36 +13,51 @@ local watchedItems = {
   "minecraft:redstone",
 }
 
-local function findEnergyStorage()
-  for _, name in ipairs(peripheral.getNames()) do
-    if peripheral.hasType(name, "energy_storage") then
-      return peripheral.wrap(name)
-    end
-  end
-  return nil
-end
-
-local function findEnergyDetectors()
-  local detectors = {}
-
-  for _, name in ipairs(peripheral.getNames()) do
-    if peripheral.hasType(name, "energyDetector") or peripheral.hasType(name, "energy_detector") then
-      table.insert(detectors, peripheral.wrap(name))
-    end
-  end
-
-  return detectors[1], detectors[2]
-end
-
-local fluxStorage = findEnergyStorage()
-local inputDetector, outputDetector = findEnergyDetectors()
-
 local function safeCall(obj, method, default)
   if not obj or not obj[method] then return default end
   local ok, result = pcall(obj[method])
   if ok and result ~= nil then return result end
   return default
 end
+
+local function findPowerStorage()
+  for _, name in ipairs(peripheral.getNames()) do
+    local p = peripheral.wrap(name)
+
+    if peripheral.hasType(name, "energy_storage") then
+      return p, name, "energy_storage"
+    end
+
+    if p.getEnergy and p.getEnergyCapacity then
+      return p, name, "getEnergy"
+    end
+
+    if p.getEnergyStored and p.getMaxEnergyStored then
+      return p, name, "getEnergyStored"
+    end
+  end
+
+  return nil, nil, nil
+end
+
+local function findEnergyDetectors()
+  local detectors = {}
+
+  for _, name in ipairs(peripheral.getNames()) do
+    local p = peripheral.wrap(name)
+
+    if peripheral.hasType(name, "energyDetector")
+      or peripheral.hasType(name, "energy_detector")
+      or p.getTransferRate then
+      table.insert(detectors, { peripheral = p, name = name })
+    end
+  end
+
+  return detectors[1], detectors[2]
+end
+
+local powerStorage, powerName, powerMode = findPowerStorage()
+local inputDetector, outputDetector = findEnergyDetectors()
 
 local function fmt(n)
   n = tonumber(n) or 0
@@ -93,26 +108,55 @@ local function drawBar(x, y, w, value, max, color)
   monitor.write(" " .. p .. "%")
 end
 
+local function getStoredPower()
+  if not powerStorage then return 0, 0 end
+
+  if powerMode == "energy_storage" then
+    return safeCall(powerStorage, "getEnergy", 0),
+      safeCall(powerStorage, "getEnergyCapacity", 0)
+  end
+
+  if powerMode == "getEnergy" then
+    return safeCall(powerStorage, "getEnergy", 0),
+      safeCall(powerStorage, "getEnergyCapacity", 0)
+  end
+
+  if powerMode == "getEnergyStored" then
+    return safeCall(powerStorage, "getEnergyStored", 0),
+      safeCall(powerStorage, "getMaxEnergyStored", 0)
+  end
+
+  return 0, 0
+end
+
 while true do
   local w, h = monitor.getSize()
 
   writeAt(1, 1, "ATM10 BASE", colors.cyan)
   writeAt(w - 7, 1, textutils.formatTime(os.time(), true), colors.lightGray)
 
-  if fluxStorage then
-    local energy = safeCall(fluxStorage, "getEnergy", 0)
-    local capacity = safeCall(fluxStorage, "getEnergyCapacity", 0)
+  if powerStorage then
+    local energy, capacity = getStoredPower()
 
-    writeAt(1, 3, "FLUX POWER", colors.lime)
+    writeAt(1, 3, "POWER " .. powerName, colors.lime)
     writeAt(1, 4, fmt(energy) .. " / " .. fmt(capacity) .. " FE", colors.white)
     drawBar(1, 5, w - 6, energy, capacity, colors.lime)
   else
-    writeAt(1, 3, "NO FLUX STORAGE FOUND", colors.red)
+    writeAt(1, 3, "NO POWER STORAGE FOUND", colors.red)
     writeAt(1, 4, "Use wired modem on storage", colors.yellow)
+    writeAt(1, 5, "Or use Energy Detector", colors.yellow)
   end
 
-  local inputRate = safeCall(inputDetector, "getTransferRate", 0)
-  local outputRate = safeCall(outputDetector, "getTransferRate", 0)
+  local inputRate = 0
+  local outputRate = 0
+
+  if inputDetector then
+    inputRate = safeCall(inputDetector.peripheral, "getTransferRate", 0)
+  end
+
+  if outputDetector then
+    outputRate = safeCall(outputDetector.peripheral, "getTransferRate", 0)
+  end
 
   writeAt(1, 7, "IN : " .. fmt(inputRate) .. " FE/t", colors.lime)
   writeAt(1, 8, "OUT: " .. fmt(outputRate) .. " FE/t", colors.red)
