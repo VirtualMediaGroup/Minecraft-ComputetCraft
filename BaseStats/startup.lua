@@ -3,28 +3,23 @@ local me = peripheral.find("me_bridge") or peripheral.find("meBridge")
 
 if not monitor then error("No monitor found") end
 
-monitor.setTextScale(0.5)
+monitor.setTextScale(1)
 monitor.setBackgroundColor(colors.black)
 monitor.clear()
 
 local watchedItems = {
   "minecraft:iron_ingot",
-  "minecraft:gold_ingot",
   "minecraft:diamond",
   "minecraft:redstone",
-  "ae2:certus_quartz_crystal",
-  "minecraft:coal",
-  "minecraft:emerald",
-  "minecraft:netherite_ingot",
 }
 
 local function findEnergyStorage()
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.hasType(name, "energy_storage") then
-      return peripheral.wrap(name), name
+      return peripheral.wrap(name)
     end
   end
-  return nil, nil
+  return nil
 end
 
 local function findEnergyDetectors()
@@ -53,9 +48,9 @@ local function fmt(n)
   n = tonumber(n) or 0
   local abs = math.abs(n)
 
-  if abs >= 1000000000000 then return string.format("%.2fT", n / 1000000000000) end
-  if abs >= 1000000000 then return string.format("%.2fG", n / 1000000000) end
-  if abs >= 1000000 then return string.format("%.2fM", n / 1000000) end
+  if abs >= 1000000000000 then return string.format("%.1fT", n / 1000000000000) end
+  if abs >= 1000000000 then return string.format("%.1fG", n / 1000000000) end
+  if abs >= 1000000 then return string.format("%.1fM", n / 1000000) end
   if abs >= 1000 then return string.format("%.1fk", n / 1000) end
 
   return tostring(math.floor(n))
@@ -70,7 +65,9 @@ end
 
 local function pad(text, width)
   text = tostring(text)
-  if #text > width then return string.sub(text, 1, width) end
+  if #text > width then
+    return string.sub(text, 1, width)
+  end
   return text .. string.rep(" ", width - #text)
 end
 
@@ -79,26 +76,6 @@ local function writeAt(x, y, text, color)
   monitor.setCursorPos(x, y)
   monitor.setTextColor(color or colors.white)
   monitor.write(pad(text, w - x + 1))
-end
-
-local function drawBox(x, y, w, h, title, color)
-  monitor.setTextColor(color or colors.white)
-
-  monitor.setCursorPos(x, y)
-  monitor.write("+" .. string.rep("-", w - 2) .. "+")
-
-  for i = 1, h - 2 do
-    monitor.setCursorPos(x, y + i)
-    monitor.write("|" .. string.rep(" ", w - 2) .. "|")
-  end
-
-  monitor.setCursorPos(x, y + h - 1)
-  monitor.write("+" .. string.rep("-", w - 2) .. "+")
-
-  if title then
-    monitor.setCursorPos(x + 2, y)
-    monitor.write(" " .. title .. " ")
-  end
 end
 
 local function drawBar(x, y, w, value, max, color)
@@ -116,112 +93,67 @@ local function drawBar(x, y, w, value, max, color)
   monitor.write(" " .. p .. "%")
 end
 
-local function drawStaticLayout()
-  local w, h = monitor.getSize()
-
-  monitor.clear()
-  writeAt(2, 1, "ATM10 BASE DASHBOARD", colors.cyan)
-
-  drawBox(1, 3, w, 6, "ME POWER", colors.cyan)
-  drawBox(1, 10, w, 6, "FLUX POWER", colors.lime)
-  drawBox(1, 17, w, 6, "ME STORAGE", colors.lightBlue)
-  drawBox(1, 24, w, 5, "CRAFTING CPUs", colors.magenta)
-  drawBox(1, 30, w, math.max(6, h - 30), "WATCH LIST", colors.orange)
-end
-
-drawStaticLayout()
-
 while true do
   local w, h = monitor.getSize()
 
-  writeAt(w - 10, 1, textutils.formatTime(os.time(), true), colors.lightGray)
+  writeAt(1, 1, "ATM10 BASE", colors.cyan)
+  writeAt(w - 7, 1, textutils.formatTime(os.time(), true), colors.lightGray)
+
+  if fluxStorage then
+    local energy = safeCall(fluxStorage, "getEnergy", 0)
+    local capacity = safeCall(fluxStorage, "getEnergyCapacity", 0)
+
+    writeAt(1, 3, "FLUX POWER", colors.lime)
+    writeAt(1, 4, fmt(energy) .. " / " .. fmt(capacity) .. " FE", colors.white)
+    drawBar(1, 5, w - 6, energy, capacity, colors.lime)
+  else
+    writeAt(1, 3, "NO FLUX STORAGE FOUND", colors.red)
+    writeAt(1, 4, "Use wired modem on storage", colors.yellow)
+  end
+
+  local inputRate = safeCall(inputDetector, "getTransferRate", 0)
+  local outputRate = safeCall(outputDetector, "getTransferRate", 0)
+
+  writeAt(1, 7, "IN : " .. fmt(inputRate) .. " FE/t", colors.lime)
+  writeAt(1, 8, "OUT: " .. fmt(outputRate) .. " FE/t", colors.red)
 
   if me then
     local meEnergy = safeCall(me, "getEnergyStorage", 0)
     local meMaxEnergy = safeCall(me, "getMaxEnergyStorage", 0)
     local meUsage = safeCall(me, "getEnergyUsage", 0)
 
-    writeAt(3, 5, "Stored: " .. fmt(meEnergy) .. " / " .. fmt(meMaxEnergy) .. " AE", colors.white)
-    drawBar(3, 6, w - 12, meEnergy, meMaxEnergy, colors.lime)
-    writeAt(3, 7, "Usage:  " .. fmt(meUsage) .. " AE/t", colors.yellow)
+    writeAt(1, 10, "ME POWER", colors.cyan)
+    writeAt(1, 11, fmt(meEnergy) .. " / " .. fmt(meMaxEnergy) .. " AE", colors.white)
+    writeAt(1, 12, "Use: " .. fmt(meUsage) .. " AE/t", colors.yellow)
 
     local usedItems = safeCall(me, "getUsedItemStorage", 0)
     local totalItems = safeCall(me, "getTotalItemStorage", 0)
-    local usedFluids = safeCall(me, "getUsedFluidStorage", 0)
-    local totalFluids = safeCall(me, "getTotalFluidStorage", 0)
 
-    writeAt(3, 19, "Items:  " .. fmt(usedItems) .. " / " .. fmt(totalItems) .. " bytes", colors.white)
-    drawBar(3, 20, w - 12, usedItems, totalItems, colors.lightBlue)
-    writeAt(3, 21, "Fluids: " .. fmt(usedFluids) .. " / " .. fmt(totalFluids) .. " bytes", colors.white)
+    writeAt(1, 14, "ME STORAGE", colors.lightBlue)
+    writeAt(1, 15, fmt(usedItems) .. " / " .. fmt(totalItems) .. " bytes", colors.white)
+    drawBar(1, 16, w - 6, usedItems, totalItems, colors.lightBlue)
 
-    local cpus = safeCall(me, "getCraftingCPUs", {})
-    local totalCpu = 0
-    local busyCpu = 0
+    writeAt(1, 18, "ITEMS", colors.orange)
 
-    if type(cpus) == "table" then
-      for _, cpu in pairs(cpus) do
-        totalCpu = totalCpu + 1
-        if cpu.isBusy then busyCpu = busyCpu + 1 end
-      end
-    end
-
-    writeAt(3, 26, "Busy: " .. busyCpu .. " / " .. totalCpu, colors.white)
-
-    local cpuLine = ""
-    local index = 1
-    if type(cpus) == "table" then
-      for _, cpu in pairs(cpus) do
-        if index <= 4 then
-          cpuLine = cpuLine .. "CPU " .. index .. ": "
-          if cpu.isBusy then
-            cpuLine = cpuLine .. "BUSY   "
-          else
-            cpuLine = cpuLine .. "IDLE   "
-          end
-        end
-        index = index + 1
-      end
-    end
-    writeAt(3, 27, cpuLine, colors.magenta)
-
-    local y = 32
+    local y = 19
     for _, itemName in ipairs(watchedItems) do
-      if y < h then
-        local amount = 0
-        local label = itemName
+      local amount = 0
+      local label = itemName
 
-        if me.getItem then
-          local ok, item = pcall(me.getItem, { name = itemName })
-          if ok and item then
-            amount = item.amount or 0
-            label = item.displayName or itemName
-          end
+      if me.getItem then
+        local ok, item = pcall(me.getItem, { name = itemName })
+        if ok and item then
+          amount = item.amount or 0
+          label = item.displayName or itemName
         end
-
-        local line = pad(label, math.max(10, w - 16)) .. fmt(amount)
-        writeAt(3, y, line, colors.white)
-        y = y + 1
       end
+
+      writeAt(1, y, pad(label, w - 10) .. fmt(amount), colors.white)
+      y = y + 1
     end
   else
-    writeAt(3, 5, "No ME Bridge found", colors.red)
+    writeAt(1, 10, "NO ME BRIDGE FOUND", colors.red)
   end
-
-  if fluxStorage then
-    local energy = safeCall(fluxStorage, "getEnergy", 0)
-    local capacity = safeCall(fluxStorage, "getEnergyCapacity", 0)
-
-    writeAt(3, 12, "Stored: " .. fmt(energy) .. " / " .. fmt(capacity) .. " FE", colors.white)
-    drawBar(3, 13, w - 12, energy, capacity, colors.lime)
-  else
-    writeAt(3, 12, "No Flux/Energy storage found", colors.red)
-  end
-
-  local inputRate = safeCall(inputDetector, "getTransferRate", 0)
-  local outputRate = safeCall(outputDetector, "getTransferRate", 0)
-
-  writeAt(3, 14, "Input:  " .. fmt(inputRate) .. " FE/t", colors.lime)
-  writeAt(math.floor(w / 2), 14, "Output: " .. fmt(outputRate) .. " FE/t", colors.red)
 
   sleep(1)
 end
