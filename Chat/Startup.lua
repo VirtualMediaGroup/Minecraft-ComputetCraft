@@ -16,10 +16,12 @@ local CONFIG = {
     twitch = {
         enabled = true,
         channel = "your_twitch_channel",
+        connectChatEvenIfLiveCheckFails = true,
     },
     kick = {
         enabled = true,
         channel = "your_kick_channel",
+        connectChatEvenIfLiveCheckFails = true,
     },
     youtube = {
         enabled = false,
@@ -35,7 +37,7 @@ local MAX_MESSAGES = 80
 local TWITCH_UPTIME_URL = "https://decapi.me/twitch/uptime/"
 local TWITCH_IRC_WS_URL = "wss://irc-ws.chat.twitch.tv:443"
 local KICK_CHANNEL_URL = "https://kick.com/api/v2/channels/"
-local KICK_PUSHER_URL = "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=7.4.0&flash=false"
+local KICK_PUSHER_URL = "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=7.6.0&flash=false"
 local YOUTUBE_VIDEO_URL = "https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id=%s&key=%s"
 local YOUTUBE_CHAT_URL = "https://www.googleapis.com/youtube/v3/liveChat/messages?liveChatId=%s&part=snippet,authorDetails&key=%s"
 
@@ -90,17 +92,39 @@ local function httpGetBody(url, headers)
     return body
 end
 
+local function decodeJson(value)
+    local decoder = textutils.unserializeJSON or textutils.unserialiseJSON
+    if not decoder then
+        return nil
+    end
+
+    local ok, decoded = pcall(decoder, value)
+    if ok then
+        return decoded
+    end
+    return nil
+end
+
+local function encodeJson(value)
+    local encoder = textutils.serializeJSON or textutils.serialiseJSON
+    if not encoder then
+        return nil
+    end
+
+    local ok, encoded = pcall(encoder, value)
+    if ok then
+        return encoded
+    end
+    return nil
+end
+
 local function readJson(url, headers)
     local body = httpGetBody(url, headers)
     if not body then
         return nil
     end
 
-    local ok, decoded = pcall(textutils.unserializeJSON, body)
-    if ok then
-        return decoded
-    end
-    return nil
+    return decodeJson(body)
 end
 
 local function urlEncode(value)
@@ -171,12 +195,32 @@ local function twitchIsLive()
 end
 
 local function twitchConnect()
-    local ws = http.websocket(TWITCH_IRC_WS_URL)
+    local ws = http.websocket(TWITCH_IRC_WS_URL, {
+        ["User-Agent"] = "CC-Tweaked Twitch Chat Display",
+    })
     ws.send("CAP REQ :twitch.tv/tags")
-    ws.send("PASS SCHMOOPIIE")
     ws.send("NICK justinfan" .. tostring(math.random(10000, 99999)))
     ws.send("JOIN #" .. CONFIG.twitch.channel:lower())
     return ws
+end
+
+local function twitchParseLine(line, messages)
+    if line:sub(1, 4) == "PING" then
+        return "PING"
+    end
+
+    local user = line:match("display%-name=([^;]*)")
+    if not user or user == "" then
+        user = line:match(":([^!]+)!")
+    end
+
+    local message = line:match("PRIVMSG #[^ ]+ :(.+)")
+    if user and message then
+        addMessage(messages, "TW", user, message)
+        return true
+    end
+
+    return false
 end
 
 local function twitchRead(ws, messages)
@@ -185,23 +229,17 @@ local function twitchRead(ws, messages)
         return false
     end
 
-    if raw:sub(1, 4) == "PING" then
-        ws.send("PONG :tmi.twitch.tv")
-        return false
+    local changed = false
+    for line in tostring(raw):gmatch("([^\r\n]+)") do
+        local result = twitchParseLine(line, messages)
+        if result == "PING" then
+            ws.send("PONG :tmi.twitch.tv")
+        elseif result then
+            changed = true
+        end
     end
 
-    local user = raw:match("display%-name=([^;]*)")
-    if not user or user == "" then
-        user = raw:match(":([^!]+)!")
-    end
-
-    local message = raw:match("PRIVMSG #[^ ]+ :(.+)")
-    if user and message then
-        addMessage(messages, "TW", user, message)
-        return true
-    end
-
-    return false
+    return changed
 end
 
 local function kickGetChannel()
@@ -211,7 +249,8 @@ local function kickGetChannel()
 
     return readJson(KICK_CHANNEL_URL .. urlEncode(CONFIG.kick.channel), {
         ["Accept"] = "application/json",
-        ["User-Agent"] = "CC-Tweaked",
+        ["Referer"] = "https://kick.com/" .. CONFIG.kick.channel,
+        ["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     })
 end
 
@@ -240,9 +279,13 @@ local function kickConnect()
         return nil
     end
 
-    local ws = http.websocket(KICK_PUSHER_URL)
+    local ws = http.websocket(KICK_PUSHER_URL, {
+        ["Origin"] = "https://kick.com",
+        ["Referer"] = "https://kick.com/" .. CONFIG.kick.channel,
+        ["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    })
     ws.receive(2)
-    ws.send(textutils.serializeJSON({
+    ws.send(encodeJson({
         event = "pusher:subscribe",
         data = {
             auth = "",
@@ -258,13 +301,13 @@ local function kickRead(ws, messages)
         return false
     end
 
-    local envelope = textutils.unserializeJSON(raw)
+    local envelope = decodeJson(raw)
     if not envelope then
         return false
     end
 
     if envelope.event == "pusher:ping" then
-        ws.send(textutils.serializeJSON({ event = "pusher:pong", data = {} }))
+        ws.send(encodeJson({ event = "pusher:pong", data = {} }))
         return false
     end
 
@@ -274,7 +317,7 @@ local function kickRead(ws, messages)
 
     local payload = envelope.data
     if type(payload) == "string" then
-        payload = textutils.unserializeJSON(payload)
+        payload = decodeJson(payload)
     end
     if not payload then
         return false
@@ -303,6 +346,9 @@ local youtubeState = {
     nextPageToken = nil,
     nextPoll = 0,
 }
+
+local twitchWs = nil
+local kickWs = nil
 
 local function youtubeConfigured()
     return CONFIG.youtube.enabled
@@ -407,11 +453,23 @@ local function liveNames(live)
     return names
 end
 
+local function activeChatNames()
+    local names = {}
+    if twitchWs then
+        table.insert(names, "Twitch chat")
+    end
+    if kickWs then
+        table.insert(names, "Kick chat")
+    end
+    if youtubeState.liveChatId then
+        table.insert(names, "YouTube chat")
+    end
+    return names
+end
+
 math.randomseed(nowMs())
 
 local messages = {}
-local twitchWs = nil
-local kickWs = nil
 local live = { twitch = false, kick = false, youtube = false }
 local nextLiveCheck = 0
 
@@ -421,18 +479,21 @@ while true do
         live.kick = kickIsLive()
         live.youtube = youtubeIsLive()
 
-        if live.twitch and not twitchWs then
+        local wantTwitchChat = CONFIG.twitch.enabled and (live.twitch or CONFIG.twitch.connectChatEvenIfLiveCheckFails)
+        local wantKickChat = CONFIG.kick.enabled and (live.kick or CONFIG.kick.connectChatEvenIfLiveCheckFails)
+
+        if wantTwitchChat and not twitchWs then
             local ok, ws = pcall(twitchConnect)
             twitchWs = ok and ws or nil
-        elseif not live.twitch and twitchWs then
+        elseif not wantTwitchChat and twitchWs then
             closeWs(twitchWs)
             twitchWs = nil
         end
 
-        if live.kick and not kickWs then
+        if wantKickChat and not kickWs then
             local ok, ws = pcall(kickConnect)
             kickWs = ok and ws or nil
-        elseif not live.kick and kickWs then
+        elseif not wantKickChat and kickWs then
             closeWs(kickWs)
             kickWs = nil
         end
@@ -441,7 +502,8 @@ while true do
     end
 
     local names = liveNames(live)
-    if #names == 0 then
+    local chatNames = activeChatNames()
+    if #names == 0 and #chatNames == 0 then
         closeWs(twitchWs)
         closeWs(kickWs)
         twitchWs = nil
@@ -482,6 +544,9 @@ while true do
         end
 
         if changed or #messages == 0 then
+            if #names == 0 then
+                names = chatNames
+            end
             drawChat(messages, names)
         end
 
