@@ -8,7 +8,8 @@
 --   3. Edit CONFIG below before running.
 --
 -- Notes:
---   Twitch chat can usually be read anonymously.
+--   Twitch EventSub is the current official API path for reading chat.
+--   Twitch IRC can still be used as a fallback, but Twitch recommends EventSub.
 --   Kick chat uses the public websocket flow used by the Kick website; it may break if Kick changes it.
 --   YouTube chat needs a YouTube Data API key and the live video ID.
 
@@ -16,7 +17,14 @@ local CONFIG = {
     twitch = {
         enabled = true,
         channel = "your_twitch_channel",
+        mode = "irc", -- "eventsub" for Twitch's current API, or "irc" for simple fallback.
         connectChatEvenIfLiveCheckFails = true,
+        eventsub = {
+            clientId = "your_twitch_client_id",
+            accessToken = "your_twitch_user_access_token",
+            broadcasterUserId = "your_twitch_broadcaster_user_id",
+            userId = "your_twitch_token_user_id",
+        },
     },
     kick = {
         enabled = true,
@@ -36,6 +44,8 @@ local MAX_MESSAGES = 80
 
 local TWITCH_UPTIME_URL = "https://decapi.me/twitch/uptime/"
 local TWITCH_IRC_WS_URL = "wss://irc-ws.chat.twitch.tv:443"
+local TWITCH_EVENTSUB_WS_URL = "wss://eventsub.wss.twitch.tv/ws?keepalive_timeout_seconds=30"
+local TWITCH_EVENTSUB_SUBSCRIBE_URL = "https://api.twitch.tv/helix/eventsub/subscriptions"
 local KICK_CHANNEL_URL = "https://kick.com/api/v2/channels/"
 local KICK_PUSHER_URL = "wss://ws-us2.pusher.com/app/32cbd69e4b950bf97679?protocol=7&client=js&version=7.6.0&flash=false"
 local YOUTUBE_VIDEO_URL = "https://www.googleapis.com/youtube/v3/videos?part=liveStreamingDetails&id=%s&key=%s"
@@ -127,6 +137,29 @@ local function readJson(url, headers)
     return decodeJson(body)
 end
 
+local function postJson(url, payload, headers)
+    local body = encodeJson(payload)
+    if not body then
+        return nil
+    end
+
+    headers = headers or {}
+    headers["Content-Type"] = "application/json"
+
+    local ok, response = pcall(http.post, url, body, headers)
+    if not ok or not response then
+        return nil
+    end
+
+    local responseBody = response.readAll()
+    response.close()
+
+    if not responseBody or responseBody == "" then
+        return {}
+    end
+    return decodeJson(responseBody) or {}
+end
+
 local function urlEncode(value)
     if textutils.urlEncode then
         return textutils.urlEncode(value)
@@ -142,6 +175,14 @@ local function addMessage(messages, platform, user, message)
     table.insert(messages, "[" .. platform .. "] " .. user .. ": " .. message)
     while #messages > MAX_MESSAGES do
         table.remove(messages, 1)
+    end
+end
+
+local function closeWs(ws)
+    if ws then
+        pcall(function()
+            ws.close()
+        end)
     end
 end
 
@@ -194,13 +235,82 @@ local function twitchIsLive()
     return not body:find("offline", 1, true) and not body:find("not live", 1, true)
 end
 
+local twitchEventSubConnect
+local twitchEventSubRead
+
 local function twitchConnect()
+    if CONFIG.twitch.mode == "eventsub" then
+        return twitchEventSubConnect()
+    end
+
     local ws = http.websocket(TWITCH_IRC_WS_URL, {
         ["User-Agent"] = "CC-Tweaked Twitch Chat Display",
     })
     ws.send("CAP REQ :twitch.tv/tags")
     ws.send("NICK justinfan" .. tostring(math.random(10000, 99999)))
     ws.send("JOIN #" .. CONFIG.twitch.channel:lower())
+    return ws
+end
+
+local function twitchEventSubConfigured()
+    local eventsub = CONFIG.twitch.eventsub or {}
+    return CONFIG.twitch.mode == "eventsub"
+        and eventsub.clientId ~= ""
+        and eventsub.clientId ~= "your_twitch_client_id"
+        and eventsub.accessToken ~= ""
+        and eventsub.accessToken ~= "your_twitch_user_access_token"
+        and eventsub.broadcasterUserId ~= ""
+        and eventsub.broadcasterUserId ~= "your_twitch_broadcaster_user_id"
+        and eventsub.userId ~= ""
+        and eventsub.userId ~= "your_twitch_token_user_id"
+end
+
+local function twitchEventSubSubscribe(sessionId)
+    if not twitchEventSubConfigured() then
+        return false
+    end
+
+    local eventsub = CONFIG.twitch.eventsub
+    local response = postJson(TWITCH_EVENTSUB_SUBSCRIBE_URL, {
+        type = "channel.chat.message",
+        version = "1",
+        condition = {
+            broadcaster_user_id = eventsub.broadcasterUserId,
+            user_id = eventsub.userId,
+        },
+        transport = {
+            method = "websocket",
+            session_id = sessionId,
+        },
+    }, {
+        ["Authorization"] = "Bearer " .. eventsub.accessToken,
+        ["Client-Id"] = eventsub.clientId,
+    })
+
+    return response ~= nil
+end
+
+twitchEventSubConnect = function()
+    if not twitchEventSubConfigured() then
+        return nil
+    end
+
+    local ws = http.websocket(TWITCH_EVENTSUB_WS_URL, {
+        ["User-Agent"] = "CC-Tweaked Twitch EventSub Display",
+    })
+    local welcome = ws.receive(8)
+    local data = welcome and decodeJson(welcome)
+    local session = data and data.payload and data.payload.session
+    if not session or not session.id then
+        closeWs(ws)
+        return nil
+    end
+
+    if not twitchEventSubSubscribe(session.id) then
+        closeWs(ws)
+        return nil
+    end
+
     return ws
 end
 
@@ -224,6 +334,10 @@ local function twitchParseLine(line, messages)
 end
 
 local function twitchRead(ws, messages)
+    if CONFIG.twitch.mode == "eventsub" then
+        return twitchEventSubRead(ws, messages)
+    end
+
     local raw = ws.receive(0.1)
     if not raw then
         return false
@@ -240,6 +354,51 @@ local function twitchRead(ws, messages)
     end
 
     return changed
+end
+
+twitchEventSubRead = function(ws, messages)
+    local raw = ws.receive(0.1)
+    if not raw then
+        return false
+    end
+
+    local data = decodeJson(raw)
+    if not data or not data.metadata then
+        return false
+    end
+
+    local messageType = data.metadata.message_type
+    if messageType == "session_keepalive" then
+        return false
+    end
+
+    if messageType == "session_reconnect" then
+        local reconnectUrl = data.payload
+            and data.payload.session
+            and data.payload.session.reconnect_url
+        if reconnectUrl then
+            error("Twitch EventSub reconnect required")
+        end
+        return false
+    end
+
+    if messageType ~= "notification" then
+        return false
+    end
+
+    local event = data.payload and data.payload.event
+    if not event then
+        return false
+    end
+
+    local user = event.chatter_user_name or event.chatter_user_login or "unknown"
+    local message = event.message and event.message.text
+    if message then
+        addMessage(messages, "TW", user, message)
+        return true
+    end
+
+    return false
 end
 
 local function kickGetChannel()
@@ -415,14 +574,6 @@ local function youtubePoll(messages)
     end
 
     return changed
-end
-
-local function closeWs(ws)
-    if ws then
-        pcall(function()
-            ws.close()
-        end)
-    end
 end
 
 local function enabledNames()
