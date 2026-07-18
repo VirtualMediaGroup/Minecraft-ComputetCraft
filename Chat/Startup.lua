@@ -14,11 +14,21 @@
 --   YouTube chat needs a YouTube Data API key and the live video ID.
 
 local CONFIG = {
+    ui = {
+        monitorTextScale = 0.75, -- Increase to 1.0 for easier reading; lower to 0.5 for more lines.
+        maxChatMessages = 80,
+        maxEvents = 12,
+    },
     twitch = {
         enabled = true,
         channel = "your_twitch_channel",
         mode = "irc", -- "eventsub" for Twitch's current API, or "irc" for simple fallback.
         connectChatEvenIfLiveCheckFails = true,
+        events = {
+            chatNotifications = true, -- Subs, gift subs, raids, announcements, etc. Needs user:read:chat.
+            subscriptions = true, -- Direct sub/gift/resub EventSub types. Needs channel:read:subscriptions.
+            channelPointRedeems = true, -- Needs channel:read:redemptions.
+        },
         eventsub = {
             clientId = "your_twitch_client_id",
             accessToken = "your_twitch_user_access_token",
@@ -40,9 +50,11 @@ local CONFIG = {
 
 local CHECK_INTERVAL = 30
 local YOUTUBE_POLL_INTERVAL = 6
-local MAX_MESSAGES = 80
+local MAX_MESSAGES = CONFIG.ui.maxChatMessages or 80
+local MAX_EVENTS = CONFIG.ui.maxEvents or 12
 
 local TWITCH_UPTIME_URL = "https://decapi.me/twitch/uptime/"
+local TWITCH_VIEWERS_URL = "https://decapi.me/twitch/viewercount/"
 local TWITCH_IRC_WS_URL = "wss://irc-ws.chat.twitch.tv:443"
 local TWITCH_EVENTSUB_WS_URL = "wss://eventsub.wss.twitch.tv/ws?keepalive_timeout_seconds=30"
 local TWITCH_EVENTSUB_SUBSCRIBE_URL = "https://api.twitch.tv/helix/eventsub/subscriptions"
@@ -54,7 +66,7 @@ local YOUTUBE_CHAT_URL = "https://www.googleapis.com/youtube/v3/liveChat/message
 local function findDisplay()
     local monitor = peripheral.find("monitor")
     if monitor then
-        monitor.setTextScale(0.5)
+        monitor.setTextScale(CONFIG.ui.monitorTextScale or 0.75)
         return monitor
     end
     return term.current()
@@ -169,12 +181,43 @@ local function urlEncode(value)
     end)
 end
 
+local function platformBadge(platform)
+    if platform == "TW" then
+        return "[T]"
+    end
+    if platform == "KICK" then
+        return "[K]"
+    end
+    if platform == "YT" then
+        return "[Y]"
+    end
+    return "[" .. tostring(platform or "?"):sub(1, 1) .. "]"
+end
+
+local function profileBadge(user)
+    user = tostring(user or "?")
+    local first = user:sub(1, 1)
+    if first == "" then
+        first = "?"
+    end
+    return "(" .. first:upper() .. ")"
+end
+
 local function addMessage(messages, platform, user, message)
     user = tostring(user or "unknown")
     message = tostring(message or "")
-    table.insert(messages, "[" .. platform .. "] " .. user .. ": " .. message)
+    table.insert(messages, platformBadge(platform) .. " " .. profileBadge(user) .. " " .. user .. ": " .. message)
     while #messages > MAX_MESSAGES do
         table.remove(messages, 1)
+    end
+end
+
+local function addEvent(events, platform, title, detail)
+    title = tostring(title or "Event")
+    detail = tostring(detail or "")
+    table.insert(events, "[" .. platform .. "] " .. title .. ": " .. detail)
+    while #events > MAX_EVENTS do
+        table.remove(events, 1)
     end
 end
 
@@ -186,39 +229,106 @@ local function closeWs(ws)
     end
 end
 
+local function writeAt(x, y, text, color)
+    display.setCursorPos(x, y)
+    display.setTextColor(color or colors.white)
+    display.write(text)
+end
+
+local function drawLine(y, width)
+    display.setCursorPos(1, y)
+    display.setTextColor(colors.gray)
+    display.write(string.rep("-", width))
+end
+
 local function drawOffline(status)
-    local _, h = display.getSize()
+    local w, h = display.getSize()
     clear(colors.black, colors.white)
     center(math.max(1, math.floor(h / 2) - 2), "STREAM CHAT", colors.lightGray)
     center(math.max(1, math.floor(h / 2)), "OFFLINE", colors.red)
     center(math.min(h, math.floor(h / 2) + 2), status or "Checking streams...", colors.gray)
+    drawLine(math.max(1, h - 1), w)
+    center(h, "OFFLINE", colors.red)
 end
 
-local function drawChat(messages, liveNames)
+local function drawList(title, items, x, y, width, height, titleColor)
+    writeAt(x, y, trimToWidth(title, width), titleColor or colors.white)
+    display.setCursorPos(x, y + 1)
+    display.setTextColor(colors.gray)
+    display.write(string.rep("-", width))
+
+    local availableRows = math.max(0, height - 2)
+    local first = math.max(1, #items - availableRows + 1)
+    local row = y + 2
+    for i = first, #items do
+        if row >= y + height then
+            break
+        end
+        writeAt(x, row, trimToWidth(items[i], width), colors.white)
+        row = row + 1
+    end
+
+    if #items == 0 and availableRows > 0 then
+        writeAt(x, y + 2, "Waiting for activity...", colors.gray)
+    end
+end
+
+local function viewerFooterText(live, viewers)
+    if not live.twitch and not live.kick and not live.youtube then
+        return "OFFLINE"
+    end
+
+    local parts = {}
+    if live.twitch then
+        table.insert(parts, "Twitch: " .. tostring(viewers.twitch or "?"))
+    end
+    if live.kick then
+        table.insert(parts, "Kick: " .. tostring(viewers.kick or "?"))
+    end
+    if live.youtube then
+        table.insert(parts, "YouTube: " .. tostring(viewers.youtube or "?"))
+    end
+
+    if #parts == 0 then
+        return "Viewers: ?"
+    end
+    return "Viewers  " .. table.concat(parts, " | ")
+end
+
+local function drawFooter(live, viewers)
+    local w, h = display.getSize()
+    drawLine(math.max(1, h - 1), w)
+    local text = viewerFooterText(live, viewers)
+    center(h, trimToWidth(text, w), text == "OFFLINE" and colors.red or colors.lime)
+end
+
+local function drawDashboard(messages, events, liveNames, live, viewers)
     local w, h = display.getSize()
     clear(colors.black, colors.white)
 
-    display.setCursorPos(1, 1)
-    display.setTextColor(colors.lime)
-    display.write("LIVE ")
-    display.setTextColor(colors.white)
-    display.write(trimToWidth(table.concat(liveNames, " + "), math.max(1, w - 5)))
+    writeAt(1, 1, "STREAM DASH", colors.cyan)
+    writeAt(13, 1, "LIVE " .. trimToWidth(table.concat(liveNames, " + "), math.max(1, w - 18)), colors.lime)
+    drawLine(2, w)
 
-    display.setCursorPos(1, 2)
-    display.setTextColor(colors.gray)
-    display.write(string.rep("-", w))
+    local contentHeight = math.max(1, h - 4)
+    if w >= 70 and h >= 12 then
+        local eventWidth = math.max(22, math.floor(w * 0.36))
+        local chatX = eventWidth + 2
+        local chatWidth = w - eventWidth - 1
+        drawList("EVENTS", events, 1, 3, eventWidth, contentHeight, colors.yellow)
 
-    local first = math.max(1, #messages - (h - 3) + 1)
-    local row = 3
-    for i = first, #messages do
-        display.setCursorPos(1, row)
-        display.setTextColor(colors.white)
-        display.write(trimToWidth(messages[i], w))
-        row = row + 1
-        if row > h then
-            break
+        for row = 3, h - 2 do
+            writeAt(eventWidth + 1, row, "|", colors.gray)
         end
+
+        drawList("CHAT", messages, chatX, 3, chatWidth, contentHeight, colors.lightBlue)
+    else
+        local eventHeight = math.min(math.max(4, math.floor(contentHeight * 0.35)), 8)
+        drawList("EVENTS", events, 1, 3, w, eventHeight, colors.yellow)
+        drawList("CHAT", messages, 1, 3 + eventHeight, w, contentHeight - eventHeight, colors.lightBlue)
     end
+
+    drawFooter(live or {}, viewers or {})
 end
 
 local function twitchIsLive()
@@ -233,6 +343,20 @@ local function twitchIsLive()
 
     body = body:lower()
     return not body:find("offline", 1, true) and not body:find("not live", 1, true)
+end
+
+local function twitchViewerCount()
+    if not CONFIG.twitch.enabled then
+        return nil
+    end
+
+    local body = httpGetBody(TWITCH_VIEWERS_URL .. urlEncode(CONFIG.twitch.channel))
+    if not body then
+        return nil
+    end
+
+    local count = body:match("(%d+)")
+    return count and tonumber(count) or nil
 end
 
 local twitchEventSubConnect
@@ -265,19 +389,16 @@ local function twitchEventSubConfigured()
         and eventsub.userId ~= "your_twitch_token_user_id"
 end
 
-local function twitchEventSubSubscribe(sessionId)
+local function twitchEventSubSubscribeOne(sessionId, subscriptionType, version, condition)
     if not twitchEventSubConfigured() then
         return false
     end
 
     local eventsub = CONFIG.twitch.eventsub
     local response = postJson(TWITCH_EVENTSUB_SUBSCRIBE_URL, {
-        type = "channel.chat.message",
-        version = "1",
-        condition = {
-            broadcaster_user_id = eventsub.broadcasterUserId,
-            user_id = eventsub.userId,
-        },
+        type = subscriptionType,
+        version = version or "1",
+        condition = condition,
         transport = {
             method = "websocket",
             session_id = sessionId,
@@ -288,6 +409,40 @@ local function twitchEventSubSubscribe(sessionId)
     })
 
     return response ~= nil
+end
+
+local function twitchEventSubSubscribe(sessionId)
+    if not twitchEventSubConfigured() then
+        return false
+    end
+
+    local eventsub = CONFIG.twitch.eventsub
+    local eventsConfig = CONFIG.twitch.events or {}
+    local chatCondition = {
+        broadcaster_user_id = eventsub.broadcasterUserId,
+        user_id = eventsub.userId,
+    }
+    local channelCondition = {
+        broadcaster_user_id = eventsub.broadcasterUserId,
+    }
+
+    local ok = twitchEventSubSubscribeOne(sessionId, "channel.chat.message", "1", chatCondition)
+
+    if eventsConfig.chatNotifications then
+        twitchEventSubSubscribeOne(sessionId, "channel.chat.notification", "1", chatCondition)
+    end
+
+    if eventsConfig.subscriptions then
+        twitchEventSubSubscribeOne(sessionId, "channel.subscribe", "1", channelCondition)
+        twitchEventSubSubscribeOne(sessionId, "channel.subscription.gift", "1", channelCondition)
+        twitchEventSubSubscribeOne(sessionId, "channel.subscription.message", "1", channelCondition)
+    end
+
+    if eventsConfig.channelPointRedeems then
+        twitchEventSubSubscribeOne(sessionId, "channel.channel_points_custom_reward_redemption.add", "1", channelCondition)
+    end
+
+    return ok
 end
 
 twitchEventSubConnect = function()
@@ -314,7 +469,7 @@ twitchEventSubConnect = function()
     return ws
 end
 
-local function twitchParseLine(line, messages)
+local function twitchParseLine(line, messages, events)
     if line:sub(1, 4) == "PING" then
         return "PING"
     end
@@ -333,9 +488,9 @@ local function twitchParseLine(line, messages)
     return false
 end
 
-local function twitchRead(ws, messages)
+local function twitchRead(ws, messages, events)
     if CONFIG.twitch.mode == "eventsub" then
-        return twitchEventSubRead(ws, messages)
+        return twitchEventSubRead(ws, messages, events)
     end
 
     local raw = ws.receive(0.1)
@@ -345,7 +500,7 @@ local function twitchRead(ws, messages)
 
     local changed = false
     for line in tostring(raw):gmatch("([^\r\n]+)") do
-        local result = twitchParseLine(line, messages)
+        local result = twitchParseLine(line, messages, events)
         if result == "PING" then
             ws.send("PONG :tmi.twitch.tv")
         elseif result then
@@ -356,7 +511,7 @@ local function twitchRead(ws, messages)
     return changed
 end
 
-twitchEventSubRead = function(ws, messages)
+twitchEventSubRead = function(ws, messages, events)
     local raw = ws.receive(0.1)
     if not raw then
         return false
@@ -386,15 +541,57 @@ twitchEventSubRead = function(ws, messages)
         return false
     end
 
-    local event = data.payload and data.payload.event
+    local payload = data.payload or {}
+    local subscription = payload.subscription or {}
+    local subscriptionType = subscription.type
+    local event = payload.event
     if not event then
         return false
     end
 
-    local user = event.chatter_user_name or event.chatter_user_login or "unknown"
-    local message = event.message and event.message.text
-    if message then
+    if subscriptionType == "channel.chat.message" then
+        local user = event.chatter_user_name or event.chatter_user_login or "unknown"
+        local message = event.message and event.message.text
         addMessage(messages, "TW", user, message)
+        return true
+    end
+
+    if subscriptionType == "channel.chat.notification" then
+        local user = event.chatter_user_name or event.chatter_user_login or "Twitch"
+        local noticeType = event.notice_type or "notice"
+        local message = event.message and event.message.text
+        addEvent(events, "TW", noticeType, user .. (message and (" - " .. message) or ""))
+        return true
+    end
+
+    if subscriptionType == "channel.subscribe" then
+        local user = event.user_name or event.user_login or "unknown"
+        local tier = event.tier and ("tier " .. tostring(event.tier)) or "subscription"
+        local gifted = event.is_gift and " gifted" or ""
+        addEvent(events, "TW", "New sub", user .. " " .. tier .. gifted)
+        return true
+    end
+
+    if subscriptionType == "channel.subscription.gift" then
+        local user = event.user_name or event.user_login or "anonymous"
+        local total = event.total or 1
+        addEvent(events, "TW", "Gift subs", user .. " gifted " .. tostring(total))
+        return true
+    end
+
+    if subscriptionType == "channel.subscription.message" then
+        local user = event.user_name or event.user_login or "unknown"
+        local cumulative = event.cumulative_months and (tostring(event.cumulative_months) .. " months") or "resub"
+        local text = event.message and event.message.text
+        addEvent(events, "TW", "Resub", user .. " - " .. cumulative .. (text and (" - " .. text) or ""))
+        return true
+    end
+
+    if subscriptionType == "channel.channel_points_custom_reward_redemption.add" then
+        local user = event.user_name or event.user_login or "unknown"
+        local reward = event.reward and event.reward.title or "Channel point redeem"
+        local input = event.user_input
+        addEvent(events, "TW", "Redeem", user .. " redeemed " .. reward .. (input and (" - " .. input) or ""))
         return true
     end
 
@@ -416,6 +613,16 @@ end
 local function kickIsLive()
     local data = kickGetChannel()
     return data and data.livestream ~= nil
+end
+
+local function kickViewerCount()
+    local data = kickGetChannel()
+    local livestream = data and data.livestream
+    if not livestream then
+        return nil
+    end
+
+    return livestream.viewer_count or livestream.viewers or livestream.viewers_count
 end
 
 local function kickChatroomId()
@@ -528,6 +735,7 @@ local function youtubeRefreshLiveChatId()
     local item = data and data.items and data.items[1]
     local details = item and item.liveStreamingDetails
     youtubeState.liveChatId = details and details.activeLiveChatId or nil
+    youtubeState.concurrentViewers = details and details.concurrentViewers or nil
     youtubeState.nextPageToken = nil
     return youtubeState.liveChatId ~= nil
 end
@@ -540,6 +748,15 @@ local function youtubeIsLive()
         return true
     end
     return youtubeRefreshLiveChatId()
+end
+
+local function youtubeViewerCount()
+    if not youtubeConfigured() then
+        return nil
+    end
+
+    youtubeRefreshLiveChatId()
+    return youtubeState.concurrentViewers and tonumber(youtubeState.concurrentViewers) or nil
 end
 
 local function youtubePoll(messages)
@@ -621,14 +838,21 @@ end
 math.randomseed(nowMs())
 
 local messages = {}
+local events = {}
 local live = { twitch = false, kick = false, youtube = false }
+local viewers = { twitch = nil, kick = nil, youtube = nil }
 local nextLiveCheck = 0
 
 while true do
+    local refreshedStatus = false
     if nowMs() >= nextLiveCheck then
         live.twitch = twitchIsLive()
         live.kick = kickIsLive()
         live.youtube = youtubeIsLive()
+        viewers.twitch = live.twitch and twitchViewerCount() or nil
+        viewers.kick = live.kick and kickViewerCount() or nil
+        viewers.youtube = live.youtube and youtubeViewerCount() or nil
+        refreshedStatus = true
 
         local wantTwitchChat = CONFIG.twitch.enabled and (live.twitch or CONFIG.twitch.connectChatEvenIfLiveCheckFails)
         local wantKickChat = CONFIG.kick.enabled and (live.kick or CONFIG.kick.connectChatEvenIfLiveCheckFails)
@@ -663,10 +887,10 @@ while true do
         sleep(CHECK_INTERVAL)
         nextLiveCheck = 0
     else
-        local changed = false
+        local changed = refreshedStatus
 
         if twitchWs then
-            local ok, didChange = pcall(twitchRead, twitchWs, messages)
+            local ok, didChange = pcall(twitchRead, twitchWs, messages, events)
             if not ok then
                 closeWs(twitchWs)
                 twitchWs = nil
@@ -698,7 +922,7 @@ while true do
             if #names == 0 then
                 names = chatNames
             end
-            drawChat(messages, names)
+            drawDashboard(messages, events, names, live, viewers)
         end
 
         sleep(0.2)
